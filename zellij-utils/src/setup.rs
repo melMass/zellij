@@ -322,7 +322,8 @@ pub struct Setup {
         value_name = "DIR",
         value_parser,
         exclusive = true,
-        num_args(0..=1)
+        min_values = 0,
+        max_values = 1
     )]
     pub dump_plugins: Option<Option<PathBuf>>,
 
