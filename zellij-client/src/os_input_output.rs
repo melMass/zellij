@@ -1,17 +1,29 @@
 use zellij_utils::anyhow::{Context, Result};
+use zellij_utils::interprocess::local_socket::LocalSocketListener;
 use zellij_utils::pane_size::Size;
-use zellij_utils::{interprocess, libc, nix, signal_hook};
+use zellij_utils::{interprocess, signal_hook};
+
+#[cfg(not(windows))]
+use zellij_utils::{libc, nix};
 
 use interprocess::local_socket::LocalSocketStream;
-use mio::{unix::SourceFd, Events, Interest, Poll, Token};
+#[cfg(not(windows))]
+use mio::unix::SourceFd;
+use mio::{Events, Interest, Poll, Token};
+#[cfg(not(windows))]
 use nix::pty::Winsize;
+#[cfg(not(windows))]
 use nix::sys::termios;
-use signal_hook::{consts::signal::*, iterator::Signals};
+
+use signal_hook::consts::signal::*;
+#[cfg(unix)]
+use signal_hook::iterator::Signals;
 use std::io::prelude::*;
+#[cfg(not(windows))]
 use std::os::unix::io::RawFd;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::{io, thread, time};
+use std::{io, process, thread, time};
 use zellij_utils::{
     data::Palette,
     errors::ErrorContext,
@@ -24,6 +36,7 @@ const SIGWINCH_CB_THROTTLE_DURATION: time::Duration = time::Duration::from_milli
 const ENABLE_MOUSE_SUPPORT: &str = "\u{1b}[?1000h\u{1b}[?1002h\u{1b}[?1015h\u{1b}[?1006h";
 const DISABLE_MOUSE_SUPPORT: &str = "\u{1b}[?1006l\u{1b}[?1015l\u{1b}[?1002l\u{1b}[?1000l";
 
+#[cfg(unix)]
 fn into_raw_mode(pid: RawFd) {
     let mut tio = termios::tcgetattr(pid).expect("could not get terminal attribute");
     termios::cfmakeraw(&mut tio);
@@ -33,11 +46,25 @@ fn into_raw_mode(pid: RawFd) {
     };
 }
 
+#[cfg(unix)]
 fn unset_raw_mode(pid: RawFd, orig_termios: termios::Termios) -> Result<(), nix::Error> {
     termios::tcsetattr(pid, termios::SetArg::TCSANOW, &orig_termios)
 }
 
-pub(crate) fn get_terminal_size_using_fd(fd: RawFd) -> Size {
+pub enum HandleType {
+    Stdin,
+    Stdout,
+    Stderr,
+}
+
+#[cfg(unix)]
+pub(crate) fn get_terminal_size(handle_type: HandleType) -> Size {
+    let fd = match handle_type {
+        HandleType::Stdin => 0,
+        HandleType::Stdout => 1,
+        HandleType::Stderr => 2,
+    };
+
     // TODO: do this with the nix ioctl
     use libc::ioctl;
     use libc::TIOCGWINSZ;
@@ -73,8 +100,63 @@ pub(crate) fn get_terminal_size_using_fd(fd: RawFd) -> Size {
     Size { rows, cols }
 }
 
+#[cfg(windows)]
+pub(crate) fn get_terminal_size(handle_type: HandleType) -> Size {
+    use std::os::windows::io::RawHandle;
+    use windows_sys::Win32::{
+        Foundation::INVALID_HANDLE_VALUE,
+        System::Console::{
+            GetConsoleScreenBufferInfo, GetStdHandle, CONSOLE_SCREEN_BUFFER_INFO, COORD, SMALL_RECT,
+        },
+    };
+
+    // TODO: handle other handle types, only stdout is supported for now
+    let handle_type = match handle_type {
+        // HandleType::Stdin => windows_sys::Win32::System::Console::STD_INPUT_HANDLE,
+        // HandleType::Stdout => windows_sys::Win32::System::Console::STD_OUTPUT_HANDLE,
+        // HandleType::Stderr => windows_sys::Win32::System::Console::STD_ERROR_HANDLE,
+        _ => windows_sys::Win32::System::Console::STD_OUTPUT_HANDLE,
+    };
+
+    let default_size = Size { rows: 24, cols: 80 };
+
+    // get raw windows handle
+    let handle = unsafe { GetStdHandle(handle_type) as RawHandle };
+
+    // convert between windows_sys::Win32::Foundation::HANDLE and std::os::windows::raw::HANDLE
+    let handle = handle as windows_sys::Win32::Foundation::HANDLE;
+
+    if handle == INVALID_HANDLE_VALUE {
+        return default_size;
+    }
+
+    let zc = COORD { X: 0, Y: 0 };
+    let mut csbi = CONSOLE_SCREEN_BUFFER_INFO {
+        dwSize: zc,
+        dwCursorPosition: zc,
+        wAttributes: 0,
+        srWindow: SMALL_RECT {
+            Left: 0,
+            Top: 0,
+            Right: 0,
+            Bottom: 0,
+        },
+        dwMaximumWindowSize: zc,
+    };
+
+    if unsafe { GetConsoleScreenBufferInfo(handle, &mut csbi) } == 0 {
+        return default_size;
+    }
+
+    let cols = (csbi.srWindow.Right - csbi.srWindow.Left + 1) as usize;
+    let rows = (csbi.srWindow.Bottom - csbi.srWindow.Top + 1) as usize;
+
+    return Size { rows, cols };
+}
+
 #[derive(Clone)]
 pub struct ClientOsInputOutput {
+    #[cfg(unix)]
     orig_termios: Option<Arc<Mutex<termios::Termios>>>,
     send_instructions_to_server: Arc<Mutex<Option<IpcSenderWithContext<ClientToServerMsg>>>>,
     receive_instructions_from_server: Arc<Mutex<Option<IpcReceiverWithContext<ServerToClientMsg>>>>,
@@ -86,12 +168,14 @@ pub struct ClientOsInputOutput {
 /// Zellij client requires.
 pub trait ClientOsApi: Send + Sync {
     /// Returns the size of the terminal associated to file descriptor `fd`.
-    fn get_terminal_size_using_fd(&self, fd: RawFd) -> Size;
+    fn get_terminal_size(&self, handle_type: HandleType) -> Size;
     /// Set the terminal associated to file descriptor `fd` to
     /// [raw mode](https://en.wikipedia.org/wiki/Terminal_mode).
+    #[cfg(unix)]
     fn set_raw_mode(&mut self, fd: RawFd);
     /// Set the terminal associated to file descriptor `fd` to
     /// [cooked mode](https://en.wikipedia.org/wiki/Terminal_mode).
+    #[cfg(unix)]
     fn unset_raw_mode(&self, fd: RawFd) -> Result<(), nix::Error>;
     /// Returns the writer that allows writing to standard output.
     fn get_stdout_writer(&self) -> Box<dyn io::Write>;
@@ -121,12 +205,14 @@ pub trait ClientOsApi: Send + Sync {
 }
 
 impl ClientOsApi for ClientOsInputOutput {
-    fn get_terminal_size_using_fd(&self, fd: RawFd) -> Size {
-        get_terminal_size_using_fd(fd)
+    fn get_terminal_size(&self, handle_type: HandleType) -> Size {
+        get_terminal_size(handle_type)
     }
+    #[cfg(unix)]
     fn set_raw_mode(&mut self, fd: RawFd) {
         into_raw_mode(fd);
     }
+    #[cfg(unix)]
     fn unset_raw_mode(&self, fd: RawFd) -> Result<(), nix::Error> {
         match &self.orig_termios {
             Some(orig_termios) => {
@@ -213,22 +299,25 @@ impl ClientOsApi for ClientOsInputOutput {
     }
     fn handle_signals(&self, sigwinch_cb: Box<dyn Fn()>, quit_cb: Box<dyn Fn()>) {
         let mut sigwinch_cb_timestamp = time::Instant::now();
-        let mut signals = Signals::new(&[SIGWINCH, SIGTERM, SIGINT, SIGQUIT, SIGHUP]).unwrap();
-        for signal in signals.forever() {
-            match signal {
-                SIGWINCH => {
-                    // throttle sigwinch_cb calls, reduce excessive renders while resizing
-                    if sigwinch_cb_timestamp.elapsed() < SIGWINCH_CB_THROTTLE_DURATION {
-                        thread::sleep(SIGWINCH_CB_THROTTLE_DURATION);
-                    }
-                    sigwinch_cb_timestamp = time::Instant::now();
-                    sigwinch_cb();
-                },
-                SIGTERM | SIGINT | SIGQUIT | SIGHUP => {
-                    quit_cb();
-                    break;
-                },
-                _ => unreachable!(),
+        #[cfg(unix)]
+        {
+            let mut signals = Signals::new(&[SIGWINCH, SIGTERM, SIGINT, SIGQUIT, SIGHUP]).unwrap();
+            for signal in signals.forever() {
+                match signal {
+                    SIGWINCH => {
+                        // throttle sigwinch_cb calls, reduce excessive renders while resizing
+                        if sigwinch_cb_timestamp.elapsed() < SIGWINCH_CB_THROTTLE_DURATION {
+                            thread::sleep(SIGWINCH_CB_THROTTLE_DURATION);
+                        }
+                        sigwinch_cb_timestamp = time::Instant::now();
+                        sigwinch_cb();
+                    },
+                    SIGTERM | SIGINT | SIGQUIT | SIGHUP => {
+                        quit_cb();
+                        break;
+                    },
+                    _ => unreachable!(),
+                }
             }
         }
     }
@@ -245,8 +334,22 @@ impl ClientOsApi for ClientOsInputOutput {
                 },
             }
         }
+        let socket2;
+        loop {
+            let listener_path =
+                PathBuf::from(format!("{}{}", path.to_string_lossy(), process::id()));
+            match LocalSocketListener::bind(listener_path) {
+                Ok(listener) => {
+                    socket2 = listener.accept().unwrap();
+                    break;
+                },
+                Err(_) => {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                },
+            }
+        }
         let sender = IpcSenderWithContext::new(socket);
-        let receiver = sender.get_receiver();
+        let receiver = IpcReceiverWithContext::new(socket2);
         *self.send_instructions_to_server.lock().unwrap() = Some(sender);
         *self.receive_instructions_from_server.lock().unwrap() = Some(receiver);
     }
@@ -298,7 +401,7 @@ impl Clone for Box<dyn ClientOsApi> {
         self.box_clone()
     }
 }
-
+#[cfg(unix)]
 pub fn get_client_os_input() -> Result<ClientOsInputOutput, nix::Error> {
     let current_termios = termios::tcgetattr(0)?;
     let orig_termios = Some(Arc::new(Mutex::new(current_termios)));
@@ -312,6 +415,17 @@ pub fn get_client_os_input() -> Result<ClientOsInputOutput, nix::Error> {
     })
 }
 
+#[cfg(windows)]
+pub fn get_client_os_input() -> Result<ClientOsInputOutput, ()> {
+    Ok(ClientOsInputOutput {
+        send_instructions_to_server: Arc::new(Mutex::new(None)),
+        receive_instructions_from_server: Arc::new(Mutex::new(None)),
+        reading_from_stdin: Arc::new(Mutex::new(None)),
+        session_name: Arc::new(Mutex::new(None)),
+    })
+}
+
+#[cfg(unix)]
 pub fn get_cli_client_os_input() -> Result<ClientOsInputOutput, nix::Error> {
     let orig_termios = None; // not a terminal
     let reading_from_stdin = Arc::new(Mutex::new(None));
@@ -322,6 +436,11 @@ pub fn get_cli_client_os_input() -> Result<ClientOsInputOutput, nix::Error> {
         reading_from_stdin,
         session_name: Arc::new(Mutex::new(None)),
     })
+}
+
+#[cfg(windows)]
+pub fn get_cli_client_os_input() -> Result<ClientOsInputOutput, ()> {
+    todo!()
 }
 
 pub const DEFAULT_STDIN_POLL_TIMEOUT_MS: u64 = 10;
@@ -348,6 +467,7 @@ impl StdinPoller {
 }
 
 impl Default for StdinPoller {
+    #[cfg(unix)]
     fn default() -> Self {
         let stdin = 0;
         let mut stdin_fd = SourceFd(&stdin);
@@ -364,5 +484,10 @@ impl Default for StdinPoller {
             events,
             timeout,
         }
+    }
+
+    #[cfg(windows)]
+    fn default() -> Self {
+        todo!()
     }
 }

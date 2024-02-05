@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+#[cfg(unix)]
 use std::os::unix::fs::FileTypeExt;
 use std::time::{Duration, SystemTime};
 use std::{fs, io, process};
@@ -29,9 +30,11 @@ pub(crate) fn get_sessions() -> Result<Vec<(String, Duration)>, io::ErrorKind> {
                     .and_then(|d| d.elapsed().ok())
                     .unwrap_or_default();
                 let duration = Duration::from_secs(ctime.as_secs());
+                #[cfg(unix)]
                 if file.file_type().unwrap().is_socket() && assert_socket(&file_name) {
                     sessions.push((file_name, duration));
                 }
+                // TODO windows
             });
             Ok(sessions)
         },
@@ -53,7 +56,7 @@ pub(crate) fn get_resurrectable_sessions() -> Vec<(String, Duration, Layout)> {
                     let raw_layout = match std::fs::read_to_string(&layout_file_name) {
                         Ok(raw_layout) => raw_layout,
                         Err(e) => {
-                            log::error!("Failed to read resurrection layout file: {:?}", e);
+                            log::error!("Failed to read resurrection layout file: {:?} at {:?}", e, &layout_file_name);
                             return None;
                         },
                     };
@@ -112,9 +115,11 @@ pub(crate) fn get_sessions_sorted_by_mtime() -> anyhow::Result<Vec<String>> {
                 let file = file?;
                 let file_name = file.file_name().into_string().unwrap();
                 let file_modified_at = file.metadata()?.modified()?;
+                #[cfg(unix)]
                 if file.file_type()?.is_socket() && assert_socket(&file_name) {
                     sessions_with_mtime.push((file_name, file_modified_at));
                 }
+                // TODO windows
             }
             sessions_with_mtime.sort_by_key(|x| x.1); // the oldest one will be the first
 
